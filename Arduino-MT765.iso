@@ -1,0 +1,218 @@
+/*
+ * MT765 steering, transmission, and throttle control
+ */
+
+#if (ARDUINO >= 100)
+	#include <Arduino.h>
+#else
+	#include <WProgram.h>
+#endif
+
+#include <ros.h>
+#include <std_msgs/UInt8.h>
+
+ros::NodeHandle nh;
+
+char buf[100];
+
+typedef struct control_s {
+	char *name;
+	char pin_in;
+	char pin_out;
+	byte pt_min;
+	byte pt_max;
+	byte value_in;
+	byte value_out;
+	char state;
+	unsigned long rise_time;
+	unsigned long fall_time;
+	struct control_s *next;
+} control_t;
+
+char passthrough = 1;
+
+unsigned long activity_timeout_time = 0;
+
+#define CONTROL(n, pi, po, s, ptmin, ptmax) \
+	static control_t control_ ## n = { name:(char *)#n, pin_in:pi, pin_out:po, pt_min:ptmin, pt_max:ptmax, }; \
+	void put_ ## n( const std_msgs::UInt8& msg ) { \
+		sprintf(buf, "put %s: %u", control_ ## n.name, msg.data); \
+		nh.logwarn(buf); \
+		control_ ## n.value_out = msg.data; \
+		analogWrite(control_ ## n.pin_out, control_ ## n.value_out); \
+	} \
+	void get_ ## n( ) { \
+		sprintf(buf, "get %s", control_ ## n.name); \
+		nh.logwarn(buf); \
+	} \
+
+
+#define INIT_CONTROL(n) \
+	control_ ## n.next=controls; \
+	controls=&control_ ## n; \
+	static ros::Subscriber<std_msgs::UInt8> n ## _sub("/" #n "/put", &put_ ## n ); \
+	nh.subscribe(n ## _sub); \
+
+
+control_t *controls = NULL;
+
+CONTROL(throttle, 3, 11, 230, 0, 0)
+CONTROL(transmission, 4, 10, 127, 0, 0)
+CONTROL(steering, 5, 9, 127, 110, 145)
+
+
+int enable_switch = 12;
+byte enable_switch_position = 1;
+
+// pin change interrupt
+ISR (PCINT2_vect) {
+	unsigned long now = micros();
+
+	for (control_t *control=controls; control; control = control->next) {
+		byte new_state = digitalRead(control->pin_in);
+
+
+		if ( new_state == control->state ) {
+			continue;
+		}
+
+		if ( passthrough ) {
+			digitalWrite(control->pin_out, new_state);
+		} 
+
+		// rise_time, fall_time, now
+
+		// rising
+		if ( new_state ) {
+			if (now > control->fall_time && control->fall_time > control->rise_time) { //> control->rise_time) {
+				control->value_in = (byte)(256 * (control->fall_time - control->rise_time) / (now - control->rise_time));
+			}
+
+			// If we're not in passthrough mode and we calculated the new steering setting, check for movement. 
+//			if (!passthrough && strcmp(control->name, (char *)"steering") == 0) {
+//
+//				// Steering wheel was moved.  Revert to passthrough mode.
+//				if ((control->value_in < 119) || (control->value_in > 145)) {
+//					passthrough = 1;
+//				}
+//			}
+
+			// If we're in passthrough mode and this device has limits, check them.
+			if (!passthrough) {
+				if (
+					(control->pt_min != 0) && (control->value_in < control->pt_min)
+					||
+					(control->pt_max != 0) && (control->value_in > control->pt_max)
+				
+				) {
+					passthrough = 1;
+				}
+			}
+
+			control->rise_time = now;
+		} else {
+			control->fall_time = now;
+		}
+
+
+		control->state = new_state;
+	}
+}
+
+void pciSetup(byte pin) 
+{
+    *digitalPinToPCMSK(pin) |= bit (digitalPinToPCMSKbit(pin));  // enable pin
+    PCIFR  |= bit (digitalPinToPCICRbit(pin)); // clear any outstanding interrupt
+    PCICR  |= bit (digitalPinToPCICRbit(pin)); // enable interrupt for the group 
+}
+
+
+void messageCb( const std_msgs::UInt8& msg){
+	//digitalWrite(13, HIGH-digitalRead(13));   // blink the led
+	nh.logwarn("toggle");
+
+	passthrough = msg.data;
+}
+
+void subscriber( const std_msgs::UInt8& cmd_msg){
+        nh.logwarn("throttle_set()");
+
+	//digitalWrite(13, HIGH-digitalRead(13));   // blink the led
+}
+
+
+// ros::Subscriber<std_msgs::UInt8> sub("toggle_led", &messageCb );
+
+void throttle_set( const std_msgs::UInt8& cmd_msg){
+	nh.logwarn("throttle_set()");
+	digitalWrite(13, HIGH-digitalRead(13));   // blink the led
+	controls[0].value_out = cmd_msg.data;
+}
+
+void setup()
+{
+	//static ros::Subscriber<std_msgs::UInt8> sub("/throttle/set", &throttle_set );
+	//static ros::Subscriber<std_msgs::UInt8> sub("/throttle/set", &put_throttle );
+
+	nh.initNode();
+
+	INIT_CONTROL(throttle);
+	INIT_CONTROL(transmission);
+	INIT_CONTROL(steering);
+
+
+
+
+	//nh.subscribe(throttle_sub);
+
+	if (1) {
+		for (control_t *control=controls; control; control = control->next) {
+			control->rise_time = 0;
+			control->fall_time = 0;
+			control->value_out = 127;
+			control->state = digitalRead(control->pin_in);
+			pinMode(control->pin_out, OUTPUT);
+			pciSetup(control->pin_in);
+		}
+		pinMode(enable_switch, INPUT_PULLUP);
+	}
+
+}
+
+void loop()
+{
+	nh.spinOnce();
+	if (1) {
+		enable_switch_position = digitalRead(enable_switch);
+		sprintf(buf, "loop: %u/%u", digitalRead(enable_switch), passthrough);
+		nh.logwarn(buf);
+
+		// Switch out of passthrough mode.
+		if ((passthrough == 1) && (enable_switch_position == 0)) {
+			nh.logwarn("Leaving passthrough mode.");
+			passthrough = 0;
+			for (control_t *control=controls; control; control = control->next) {
+				sprintf(buf, "%s (%u) = %d", control->name, control->pin_out, control->value_out); nh.logwarn(buf);
+				analogWrite(control->pin_out, control->value_out);
+			}
+		// Switch into passthrough mode.
+		//} else if ((passthrough == 0) && (enable_switch_position == 1)) {
+		//	nh.logwarn("Entering passthrough mode.");
+		//	passthrough = 1;
+		}
+
+
+		for (control_t *control=controls; control; control = control->next) {
+			sprintf (buf, "%s: %u->%u, %u/%u, %d",
+				control->name,
+				control->pin_in, control->pin_out,
+				control->value_in, control->value_out,
+				control->state
+			);
+			nh.logwarn(buf);
+
+		}
+	}
+	delay(1000);
+}
+
